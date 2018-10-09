@@ -41,14 +41,15 @@ def load_json(filename: str, default: Union[List, Dict, None] = None) \
 
 
 def save_json(filename: str, data: Union[List, Dict],
-              private: bool = False) -> None:
+              private: bool = False, *,
+              encoder: json.JSONEncoder = None) -> None:
     """Save JSON data to a file.
 
     Returns True on success.
     """
     tmp_filename = filename + "__TEMP__"
     try:
-        json_data = json.dumps(data, sort_keys=True, indent=4)
+        json_data = json.dumps(data, sort_keys=True, indent=4, cls=encoder)
         mode = 0o600 if private else 0o644
         with open(os.open(tmp_filename, O_WRONLY | O_CREAT | O_TRUNC, mode),
                   'w', encoding='utf-8') as fdesc:
