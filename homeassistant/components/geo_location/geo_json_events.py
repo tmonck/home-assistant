@@ -155,6 +155,7 @@ class GeoJsonLocationEvent(GeoLocationEvent):
 
     async def async_added_to_hass(self):
         """Call when entity is added to hass."""
+        await super().async_added_to_hass()
         async_dispatcher_connect(
             self.hass, SIGNAL_DELETE_ENTITY.format(self._external_id),
             self._delete_callback)
