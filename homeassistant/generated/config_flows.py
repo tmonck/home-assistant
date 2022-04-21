@@ -258,6 +258,7 @@ FLOWS = {
         "moehlenhoff_alpha2",
         "monoprice",
         "moon",
+        "moonraker",
         "motion_blinds",
         "motioneye",
         "mqtt",
