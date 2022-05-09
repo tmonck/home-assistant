@@ -1,186 +1,131 @@
-"""
-Support for devices connected to UniFi POE.
-
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/unifi/
-"""
-
-import voluptuous as vol
-
-from homeassistant import config_entries
-from homeassistant.const import (
-    CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME, CONF_VERIFY_SSL)
+"""Integration to UniFi Network and its various features."""
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
+from homeassistant.helpers.typing import ConfigType
 
-from .const import (CONF_CONTROLLER, CONF_POE_CONTROL, CONF_SITE_ID,
-                    CONTROLLER_ID, DOMAIN, LOGGER)
-from .controller import UniFiController, get_controller
-from .errors import (
-    AlreadyConfigured, AuthenticationRequired, CannotConnect, UserLevel)
+from .const import (
+    ATTR_MANUFACTURER,
+    CONF_CONTROLLER,
+    DOMAIN as UNIFI_DOMAIN,
+    LOGGER,
+    UNIFI_WIRELESS_CLIENTS,
+)
+from .controller import UniFiController
+from .services import async_setup_services, async_unload_services
 
-DEFAULT_PORT = 8443
-DEFAULT_SITE_ID = 'default'
-DEFAULT_VERIFY_SSL = False
-
-REQUIREMENTS = ['aiounifi==3']
+SAVE_DELAY = 10
+STORAGE_KEY = "unifi_data"
+STORAGE_VERSION = 1
 
 
-async def async_setup(hass, config):
-    """Component doesn't support configuration through configuration.yaml."""
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Integration doesn't support configuration through configuration.yaml."""
+    hass.data[UNIFI_WIRELESS_CLIENTS] = wireless_clients = UnifiWirelessClients(hass)
+    await wireless_clients.async_load()
+
     return True
 
 
-async def async_setup_entry(hass, config_entry):
-    """Set up the UniFi component."""
+async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Set up the UniFi Network integration."""
+    hass.data.setdefault(UNIFI_DOMAIN, {})
+
+    # Flat configuration was introduced with 2021.3
+    await async_flatten_entry_data(hass, config_entry)
+
     controller = UniFiController(hass, config_entry)
-
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-    controller_id = CONTROLLER_ID.format(
-        host=config_entry.data[CONF_CONTROLLER][CONF_HOST],
-        site=config_entry.data[CONF_CONTROLLER][CONF_SITE_ID]
-    )
-
     if not await controller.async_setup():
         return False
 
-    hass.data[DOMAIN][controller_id] = controller
+    # Unique ID was introduced with 2021.3
+    if config_entry.unique_id is None:
+        hass.config_entries.async_update_entry(
+            config_entry, unique_id=controller.site_id
+        )
+
+    if not hass.data[UNIFI_DOMAIN]:
+        async_setup_services(hass)
+
+    hass.data[UNIFI_DOMAIN][config_entry.entry_id] = controller
+
+    config_entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, controller.shutdown)
+    )
+
+    LOGGER.debug("UniFi Network config options %s", config_entry.options)
 
     if controller.mac is None:
         return True
 
-    device_registry = await \
-        hass.helpers.device_registry.async_get_registry()
+    device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
         config_entry_id=config_entry.entry_id,
+        configuration_url=controller.api.url,
         connections={(CONNECTION_NETWORK_MAC, controller.mac)},
-        manufacturer='Ubiquiti',
-        model="UniFi Controller",
-        name="UniFi Controller",
-        # sw_version=config.raw['swversion'],
+        default_manufacturer=ATTR_MANUFACTURER,
+        default_model="UniFi Network",
+        default_name="UniFi Network",
     )
 
     return True
 
 
-async def async_unload_entry(hass, config_entry):
+async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    controller_id = CONTROLLER_ID.format(
-        host=config_entry.data[CONF_CONTROLLER][CONF_HOST],
-        site=config_entry.data[CONF_CONTROLLER][CONF_SITE_ID]
-    )
-    controller = hass.data[DOMAIN].pop(controller_id)
+    controller = hass.data[UNIFI_DOMAIN].pop(config_entry.entry_id)
+
+    if not hass.data[UNIFI_DOMAIN]:
+        async_unload_services(hass)
+
     return await controller.async_reset()
 
 
-@config_entries.HANDLERS.register(DOMAIN)
-class UnifiFlowHandler(config_entries.ConfigFlow):
-    """Handle a UniFi config flow."""
+async def async_flatten_entry_data(
+    hass: HomeAssistant, config_entry: ConfigEntry
+) -> None:
+    """Simpler configuration structure for entry data.
 
-    VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
+    Keep controller key layer in case user rollbacks.
+    """
 
-    def __init__(self):
-        """Initialize the UniFi flow."""
-        self.config = None
-        self.desc = None
-        self.sites = None
+    data: dict = {**config_entry.data, **config_entry.data[CONF_CONTROLLER]}
+    if config_entry.data != data:
+        hass.config_entries.async_update_entry(config_entry, data=data)
 
-    async def async_step_user(self, user_input=None):
-        """Handle a flow initialized by the user."""
-        errors = {}
 
-        if user_input is not None:
+class UnifiWirelessClients:
+    """Class to store clients known to be wireless.
 
-            try:
-                self.config = {
-                    CONF_HOST: user_input[CONF_HOST],
-                    CONF_USERNAME: user_input[CONF_USERNAME],
-                    CONF_PASSWORD: user_input[CONF_PASSWORD],
-                    CONF_PORT: user_input.get(CONF_PORT),
-                    CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL),
-                    CONF_SITE_ID: DEFAULT_SITE_ID,
-                }
-                controller = await get_controller(self.hass, **self.config)
+    This is needed since wireless devices going offline might get marked as wired by UniFi.
+    """
 
-                self.sites = await controller.sites()
+    def __init__(self, hass):
+        """Set up client storage."""
+        self.hass = hass
+        self.data = {}
+        self._store = hass.helpers.storage.Store(STORAGE_VERSION, STORAGE_KEY)
 
-                return await self.async_step_site()
+    async def async_load(self):
+        """Load data from file."""
+        if (data := await self._store.async_load()) is not None:
+            self.data = data
 
-            except AuthenticationRequired:
-                errors['base'] = 'faulty_credentials'
+    @callback
+    def get_data(self, config_entry):
+        """Get data related to a specific controller."""
+        data = self.data.get(config_entry.entry_id, {"wireless_devices": []})
+        return set(data["wireless_devices"])
 
-            except CannotConnect:
-                errors['base'] = 'service_unavailable'
+    @callback
+    def update_data(self, data, config_entry):
+        """Update data and schedule to save to file."""
+        self.data[config_entry.entry_id] = {"wireless_devices": list(data)}
+        self._store.async_delay_save(self._data_to_save, SAVE_DELAY)
 
-            except Exception:  # pylint: disable=broad-except
-                LOGGER.error(
-                    'Unknown error connecting with UniFi Controller at %s',
-                    user_input[CONF_HOST])
-                return self.async_abort(reason='unknown')
-
-        return self.async_show_form(
-            step_id='user',
-            data_schema=vol.Schema({
-                vol.Required(CONF_HOST): str,
-                vol.Required(CONF_USERNAME): str,
-                vol.Required(CONF_PASSWORD): str,
-                vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
-                vol.Optional(
-                    CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL): bool,
-            }),
-            errors=errors,
-        )
-
-    async def async_step_site(self, user_input=None):
-        """Select site to control."""
-        errors = {}
-
-        if user_input is not None:
-
-            try:
-                desc = user_input.get(CONF_SITE_ID, self.desc)
-                for site in self.sites.values():
-                    if desc == site['desc']:
-                        if site['role'] != 'admin':
-                            raise UserLevel
-                        self.config[CONF_SITE_ID] = site['name']
-                        break
-
-                for entry in self._async_current_entries():
-                    controller = entry.data[CONF_CONTROLLER]
-                    if controller[CONF_HOST] == self.config[CONF_HOST] and \
-                       controller[CONF_SITE_ID] == self.config[CONF_SITE_ID]:
-                        raise AlreadyConfigured
-
-                data = {
-                    CONF_CONTROLLER: self.config,
-                    CONF_POE_CONTROL: True
-                }
-
-                return self.async_create_entry(
-                    title=desc,
-                    data=data
-                )
-
-            except AlreadyConfigured:
-                return self.async_abort(reason='already_configured')
-
-            except UserLevel:
-                return self.async_abort(reason='user_privilege')
-
-        if len(self.sites) == 1:
-            self.desc = next(iter(self.sites.values()))['desc']
-            return await self.async_step_site(user_input={})
-
-        sites = []
-        for site in self.sites.values():
-            sites.append(site['desc'])
-
-        return self.async_show_form(
-            step_id='site',
-            data_schema=vol.Schema({
-                vol.Required(CONF_SITE_ID): vol.In(sites)
-            }),
-            errors=errors,
-        )
+    @callback
+    def _data_to_save(self):
+        """Return data of UniFi wireless clients to store in a file."""
+        return self.data

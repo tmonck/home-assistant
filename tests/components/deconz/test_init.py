@@ -1,220 +1,189 @@
 """Test deCONZ component setup process."""
-from unittest.mock import Mock, patch
 
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.setup import async_setup_component
-from homeassistant.components import deconz
+from unittest.mock import patch
 
-from tests.common import mock_coro
+from homeassistant.components.deconz import (
+    DeconzGateway,
+    async_setup_entry,
+    async_unload_entry,
+    async_update_group_unique_id,
+)
+from homeassistant.components.deconz.const import (
+    CONF_GROUP_ID_BASE,
+    DOMAIN as DECONZ_DOMAIN,
+)
+from homeassistant.components.deconz.errors import AuthenticationRequired, CannotConnect
+from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
+from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_PORT
+from homeassistant.helpers import entity_registry as er
 
-CONFIG = {
-    "config": {
-        "bridgeid": "0123456789ABCDEF",
-        "mac": "12:34:56:78:90:ab",
-        "modelid": "deCONZ",
-        "name": "Phoscon",
-        "swversion": "2.05.35"
-    }
-}
+from .test_gateway import DECONZ_WEB_REQUEST, setup_deconz_integration
 
+from tests.common import MockConfigEntry
 
-async def test_config_with_host_passed_to_config_entry(hass):
-    """Test that configured options for a host are loaded via config entry."""
-    with patch.object(hass, 'config_entries') as mock_config_entries, \
-            patch.object(deconz, 'configured_hosts', return_value=[]), \
-            patch.object(deconz, 'load_json', return_value={}):
-        assert await async_setup_component(hass, deconz.DOMAIN, {
-            deconz.DOMAIN: {
-                deconz.CONF_HOST: '1.2.3.4',
-                deconz.CONF_PORT: 80
-            }
-        }) is True
-    # Import flow started
-    assert len(mock_config_entries.flow.mock_calls) == 2
+ENTRY1_HOST = "1.2.3.4"
+ENTRY1_PORT = 80
+ENTRY1_API_KEY = "1234567890ABCDEF"
+ENTRY1_BRIDGEID = "12345ABC"
+ENTRY1_UUID = "456DEF"
 
-
-async def test_config_file_passed_to_config_entry(hass):
-    """Test that configuration file for a host are loaded via config entry."""
-    with patch.object(hass, 'config_entries') as mock_config_entries, \
-            patch.object(deconz, 'configured_hosts', return_value=[]), \
-            patch.object(deconz, 'load_json',
-                         return_value={'host': '1.2.3.4'}):
-        assert await async_setup_component(hass, deconz.DOMAIN, {
-            deconz.DOMAIN: {}
-        }) is True
-    # Import flow started
-    assert len(mock_config_entries.flow.mock_calls) == 2
+ENTRY2_HOST = "2.3.4.5"
+ENTRY2_PORT = 80
+ENTRY2_API_KEY = "1234567890ABCDEF"
+ENTRY2_BRIDGEID = "23456DEF"
+ENTRY2_UUID = "789ACE"
 
 
-async def test_config_without_host_not_passed_to_config_entry(hass):
-    """Test that a configuration without a host does not initiate an import."""
-    with patch.object(hass, 'config_entries') as mock_config_entries, \
-            patch.object(deconz, 'configured_hosts', return_value=[]), \
-            patch.object(deconz, 'load_json', return_value={}):
-        assert await async_setup_component(hass, deconz.DOMAIN, {
-            deconz.DOMAIN: {}
-        }) is True
-    # No flow started
-    assert len(mock_config_entries.flow.mock_calls) == 0
+async def setup_entry(hass, entry):
+    """Test that setup entry works."""
+    with patch.object(DeconzGateway, "async_setup", return_value=True), patch.object(
+        DeconzGateway, "async_update_device_registry", return_value=True
+    ):
+        assert await async_setup_entry(hass, entry) is True
 
 
-async def test_config_already_registered_not_passed_to_config_entry(hass):
-    """Test that an already registered host does not initiate an import."""
-    with patch.object(hass, 'config_entries') as mock_config_entries, \
-            patch.object(deconz, 'configured_hosts',
-                         return_value=['1.2.3.4']), \
-            patch.object(deconz, 'load_json', return_value={}):
-        assert await async_setup_component(hass, deconz.DOMAIN, {
-            deconz.DOMAIN: {
-                deconz.CONF_HOST: '1.2.3.4',
-                deconz.CONF_PORT: 80
-            }
-        }) is True
-    # No flow started
-    assert len(mock_config_entries.flow.mock_calls) == 0
-
-
-async def test_config_discovery(hass):
-    """Test that a discovered bridge does not initiate an import."""
-    with patch.object(hass, 'config_entries') as mock_config_entries:
-        assert await async_setup_component(hass, deconz.DOMAIN, {}) is True
-    # No flow started
-    assert len(mock_config_entries.flow.mock_calls) == 0
-
-
-async def test_setup_entry_already_registered_bridge(hass):
-    """Test setup entry doesn't allow more than one instance of deCONZ."""
-    hass.data[deconz.DOMAIN] = True
-    assert await deconz.async_setup_entry(hass, {}) is False
-
-
-async def test_setup_entry_no_available_bridge(hass):
-    """Test setup entry fails if deCONZ is not available."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
-    with patch('pydeconz.DeconzSession.async_load_parameters',
-               return_value=mock_coro(False)):
-        assert await deconz.async_setup_entry(hass, entry) is False
-
-
-async def test_setup_entry_successful(hass):
+async def test_setup_entry_successful(hass, aioclient_mock):
     """Test setup entry is successful."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
-    with patch.object(hass, 'async_create_task') as mock_add_job, \
-        patch.object(hass, 'config_entries') as mock_config_entries, \
-        patch('pydeconz.DeconzSession.async_get_state',
-              return_value=mock_coro(CONFIG)), \
-        patch('pydeconz.DeconzSession.start', return_value=True), \
-        patch('homeassistant.helpers.device_registry.async_get_registry',
-              return_value=mock_coro(Mock())):
-        assert await deconz.async_setup_entry(hass, entry) is True
-    assert hass.data[deconz.DOMAIN]
-    assert hass.data[deconz.DATA_DECONZ_ID] == {}
-    assert len(hass.data[deconz.DATA_DECONZ_UNSUB]) == 1
-    assert len(mock_add_job.mock_calls) ==  \
-        len(deconz.SUPPORTED_PLATFORMS)
-    assert len(mock_config_entries.async_forward_entry_setup.mock_calls) == \
-        len(deconz.SUPPORTED_PLATFORMS)
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[0][1] == \
-        (entry, 'binary_sensor')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[1][1] == \
-        (entry, 'cover')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[2][1] == \
-        (entry, 'light')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[3][1] == \
-        (entry, 'scene')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[4][1] == \
-        (entry, 'sensor')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[5][1] == \
-        (entry, 'switch')
+    config_entry = await setup_deconz_integration(hass, aioclient_mock)
+
+    assert hass.data[DECONZ_DOMAIN]
+    assert config_entry.entry_id in hass.data[DECONZ_DOMAIN]
+    assert hass.data[DECONZ_DOMAIN][config_entry.entry_id].master
 
 
-async def test_unload_entry(hass):
+async def test_setup_entry_fails_config_entry_not_ready(hass):
+    """Failed authentication trigger a reauthentication flow."""
+    with patch(
+        "homeassistant.components.deconz.get_deconz_session",
+        side_effect=CannotConnect,
+    ):
+        await setup_deconz_integration(hass)
+
+    assert hass.data[DECONZ_DOMAIN] == {}
+
+
+async def test_setup_entry_fails_trigger_reauth_flow(hass):
+    """Failed authentication trigger a reauthentication flow."""
+    with patch(
+        "homeassistant.components.deconz.get_deconz_session",
+        side_effect=AuthenticationRequired,
+    ), patch.object(hass.config_entries.flow, "async_init") as mock_flow_init:
+        await setup_deconz_integration(hass)
+        mock_flow_init.assert_called_once()
+
+    assert hass.data[DECONZ_DOMAIN] == {}
+
+
+async def test_setup_entry_multiple_gateways(hass, aioclient_mock):
+    """Test setup entry is successful with multiple gateways."""
+    config_entry = await setup_deconz_integration(hass, aioclient_mock)
+    aioclient_mock.clear_requests()
+
+    data = {"config": {"bridgeid": "01234E56789B"}}
+    with patch.dict(DECONZ_WEB_REQUEST, data):
+        config_entry2 = await setup_deconz_integration(
+            hass,
+            aioclient_mock,
+            entry_id="2",
+            unique_id="01234E56789B",
+        )
+
+    assert len(hass.data[DECONZ_DOMAIN]) == 2
+    assert hass.data[DECONZ_DOMAIN][config_entry.entry_id].master
+    assert not hass.data[DECONZ_DOMAIN][config_entry2.entry_id].master
+
+
+async def test_unload_entry(hass, aioclient_mock):
     """Test being able to unload an entry."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
-    entry.async_unload.return_value = mock_coro(True)
-    deconzmock = Mock()
-    deconzmock.async_load_parameters.return_value = mock_coro(True)
-    deconzmock.sensors = {}
-    with patch('pydeconz.DeconzSession', return_value=deconzmock):
-        assert await deconz.async_setup_entry(hass, entry) is True
+    config_entry = await setup_deconz_integration(hass, aioclient_mock)
+    assert hass.data[DECONZ_DOMAIN]
 
-    assert deconz.DATA_DECONZ_EVENT in hass.data
-
-    hass.data[deconz.DATA_DECONZ_EVENT].append(Mock())
-    hass.data[deconz.DATA_DECONZ_ID] = {'id': 'deconzid'}
-    assert await deconz.async_unload_entry(hass, entry)
-    assert deconz.DOMAIN not in hass.data
-    assert len(hass.data[deconz.DATA_DECONZ_UNSUB]) == 0
-    assert len(hass.data[deconz.DATA_DECONZ_EVENT]) == 0
-    assert len(hass.data[deconz.DATA_DECONZ_ID]) == 0
+    assert await async_unload_entry(hass, config_entry)
+    assert not hass.data[DECONZ_DOMAIN]
 
 
-async def test_add_new_device(hass):
-    """Test adding a new device generates a signal for platforms."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80,
-                  'api_key': '1234567890ABCDEF', 'allow_clip_sensor': False}
-    new_event = {
-        "t": "event",
-        "e": "added",
-        "r": "sensors",
-        "id": "1",
-        "sensor": {
-            "config": {
-                "on": "True",
-                "reachable": "True"
-            },
-            "name": "event",
-            "state": {},
-            "type": "ZHASwitch"
-        }
-    }
-    with patch.object(deconz, 'async_dispatcher_send') as mock_dispatch_send, \
-            patch('pydeconz.DeconzSession.async_get_state',
-                  return_value=mock_coro(CONFIG)), \
-            patch('pydeconz.DeconzSession.start', return_value=True):
-        assert await deconz.async_setup_entry(hass, entry) is True
-        hass.data[deconz.DOMAIN].async_event_handler(new_event)
-        await hass.async_block_till_done()
-        assert len(mock_dispatch_send.mock_calls) == 1
-        assert len(mock_dispatch_send.mock_calls[0]) == 3
+async def test_unload_entry_multiple_gateways(hass, aioclient_mock):
+    """Test being able to unload an entry and master gateway gets moved."""
+    config_entry = await setup_deconz_integration(hass, aioclient_mock)
+    aioclient_mock.clear_requests()
+
+    data = {"config": {"bridgeid": "01234E56789B"}}
+    with patch.dict(DECONZ_WEB_REQUEST, data):
+        config_entry2 = await setup_deconz_integration(
+            hass,
+            aioclient_mock,
+            entry_id="2",
+            unique_id="01234E56789B",
+        )
+
+    assert len(hass.data[DECONZ_DOMAIN]) == 2
+
+    assert await async_unload_entry(hass, config_entry)
+
+    assert len(hass.data[DECONZ_DOMAIN]) == 1
+    assert hass.data[DECONZ_DOMAIN][config_entry2.entry_id].master
 
 
-async def test_add_new_remote(hass):
-    """Test new added device creates a new remote."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80,
-                  'api_key': '1234567890ABCDEF', 'allow_clip_sensor': False}
-    remote = Mock()
-    remote.name = 'name'
-    remote.type = 'ZHASwitch'
-    remote.register_async_callback = Mock()
-    with patch('pydeconz.DeconzSession.async_get_state',
-               return_value=mock_coro(CONFIG)), \
-            patch('pydeconz.DeconzSession.start', return_value=True):
-        assert await deconz.async_setup_entry(hass, entry) is True
-    async_dispatcher_send(hass, 'deconz_new_sensor', [remote])
-    await hass.async_block_till_done()
-    assert len(hass.data[deconz.DATA_DECONZ_EVENT]) == 1
+async def test_update_group_unique_id(hass):
+    """Test successful migration of entry data."""
+    old_unique_id = "123"
+    new_unique_id = "1234"
+    entry = MockConfigEntry(
+        domain=DECONZ_DOMAIN,
+        unique_id=new_unique_id,
+        data={
+            CONF_API_KEY: "1",
+            CONF_HOST: "2",
+            CONF_GROUP_ID_BASE: old_unique_id,
+            CONF_PORT: "3",
+        },
+    )
+
+    registry = er.async_get(hass)
+    # Create entity entry to migrate to new unique ID
+    registry.async_get_or_create(
+        LIGHT_DOMAIN,
+        DECONZ_DOMAIN,
+        f"{old_unique_id}-OLD",
+        suggested_object_id="old",
+        config_entry=entry,
+    )
+    # Create entity entry with new unique ID
+    registry.async_get_or_create(
+        LIGHT_DOMAIN,
+        DECONZ_DOMAIN,
+        f"{new_unique_id}-NEW",
+        suggested_object_id="new",
+        config_entry=entry,
+    )
+
+    await async_update_group_unique_id(hass, entry)
+
+    assert entry.data == {CONF_API_KEY: "1", CONF_HOST: "2", CONF_PORT: "3"}
+    assert registry.async_get(f"{LIGHT_DOMAIN}.old").unique_id == f"{new_unique_id}-OLD"
+    assert registry.async_get(f"{LIGHT_DOMAIN}.new").unique_id == f"{new_unique_id}-NEW"
 
 
-async def test_do_not_allow_clip_sensor(hass):
-    """Test that clip sensors can be ignored."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80,
-                  'api_key': '1234567890ABCDEF', 'allow_clip_sensor': False}
-    remote = Mock()
-    remote.name = 'name'
-    remote.type = 'CLIPSwitch'
-    remote.register_async_callback = Mock()
-    with patch('pydeconz.DeconzSession.async_get_state',
-               return_value=mock_coro(CONFIG)), \
-            patch('pydeconz.DeconzSession.start', return_value=True):
-        assert await deconz.async_setup_entry(hass, entry) is True
+async def test_update_group_unique_id_no_legacy_group_id(hass):
+    """Test migration doesn't trigger without old legacy group id in entry data."""
+    old_unique_id = "123"
+    new_unique_id = "1234"
+    entry = MockConfigEntry(
+        domain=DECONZ_DOMAIN,
+        unique_id=new_unique_id,
+        data={},
+    )
 
-    async_dispatcher_send(hass, 'deconz_new_sensor', [remote])
-    await hass.async_block_till_done()
-    assert len(hass.data[deconz.DATA_DECONZ_EVENT]) == 0
+    registry = er.async_get(hass)
+    # Create entity entry to migrate to new unique ID
+    registry.async_get_or_create(
+        LIGHT_DOMAIN,
+        DECONZ_DOMAIN,
+        f"{old_unique_id}-OLD",
+        suggested_object_id="old",
+        config_entry=entry,
+    )
+
+    await async_update_group_unique_id(hass, entry)
+
+    assert registry.async_get(f"{LIGHT_DOMAIN}.old").unique_id == f"{old_unique_id}-OLD"

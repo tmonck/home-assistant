@@ -1,127 +1,239 @@
-"""Lovelace UI."""
+"""Support for the Lovelace UI."""
 import logging
-import uuid
-import os
-from os import O_WRONLY, O_CREAT, O_TRUNC
-from collections import OrderedDict
-from typing import Union, List, Dict
+
 import voluptuous as vol
 
-from homeassistant.components import websocket_api
+from homeassistant.components import frontend, websocket_api
+from homeassistant.config import async_hass_config_yaml, async_process_component_config
+from homeassistant.const import CONF_FILENAME, CONF_MODE, CONF_RESOURCES
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import collection, config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
+
+from . import dashboard, resources, websocket
+from .const import (
+    CONF_ICON,
+    CONF_REQUIRE_ADMIN,
+    CONF_SHOW_IN_SIDEBAR,
+    CONF_TITLE,
+    CONF_URL_PATH,
+    DASHBOARD_BASE_CREATE_FIELDS,
+    DEFAULT_ICON,
+    DOMAIN,
+    MODE_STORAGE,
+    MODE_YAML,
+    RESOURCE_CREATE_FIELDS,
+    RESOURCE_RELOAD_SERVICE_SCHEMA,
+    RESOURCE_SCHEMA,
+    RESOURCE_UPDATE_FIELDS,
+    SERVICE_RELOAD_RESOURCES,
+    STORAGE_DASHBOARD_CREATE_FIELDS,
+    STORAGE_DASHBOARD_UPDATE_FIELDS,
+    url_slug,
+)
+from .system_health import system_health_info  # noqa: F401
 
 _LOGGER = logging.getLogger(__name__)
-DOMAIN = 'lovelace'
-REQUIREMENTS = ['ruamel.yaml==0.15.72']
 
-OLD_WS_TYPE_GET_LOVELACE_UI = 'frontend/lovelace_config'
-WS_TYPE_GET_LOVELACE_UI = 'lovelace/config'
+CONF_DASHBOARDS = "dashboards"
 
-SCHEMA_GET_LOVELACE_UI = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): vol.Any(WS_TYPE_GET_LOVELACE_UI,
-                                  OLD_WS_TYPE_GET_LOVELACE_UI),
-})
+YAML_DASHBOARD_SCHEMA = vol.Schema(
+    {
+        **DASHBOARD_BASE_CREATE_FIELDS,
+        vol.Required(CONF_MODE): MODE_YAML,
+        vol.Required(CONF_FILENAME): cv.path,
+    }
+)
 
-JSON_TYPE = Union[List, Dict, str]  # pylint: disable=invalid-name
-
-
-class WriteError(HomeAssistantError):
-    """Error writing the data."""
-
-
-def save_yaml(fname: str, data: JSON_TYPE):
-    """Save a YAML file."""
-    from ruamel.yaml import YAML
-    from ruamel.yaml.error import YAMLError
-    yaml = YAML(typ='rt')
-    yaml.indent(sequence=4, offset=2)
-    tmp_fname = fname + "__TEMP__"
-    try:
-        with open(os.open(tmp_fname, O_WRONLY | O_CREAT | O_TRUNC, 0o644),
-                  'w', encoding='utf-8') as temp_file:
-            yaml.dump(data, temp_file)
-        os.replace(tmp_fname, fname)
-    except YAMLError as exc:
-        _LOGGER.error(str(exc))
-        raise HomeAssistantError(exc)
-    except OSError as exc:
-        _LOGGER.exception('Saving YAML file failed: %s', fname)
-        raise WriteError(exc)
-    finally:
-        if os.path.exists(tmp_fname):
-            try:
-                os.remove(tmp_fname)
-            except OSError as exc:
-                # If we are cleaning up then something else went wrong, so
-                # we should suppress likely follow-on errors in the cleanup
-                _LOGGER.error("YAML replacement cleanup failed: %s", exc)
+CONFIG_SCHEMA = vol.Schema(
+    {
+        vol.Optional(DOMAIN, default={}): vol.Schema(
+            {
+                vol.Optional(CONF_MODE, default=MODE_STORAGE): vol.All(
+                    vol.Lower, vol.In([MODE_YAML, MODE_STORAGE])
+                ),
+                vol.Optional(CONF_DASHBOARDS): cv.schema_with_slug_keys(
+                    YAML_DASHBOARD_SCHEMA,
+                    slug_validator=url_slug,
+                ),
+                vol.Optional(CONF_RESOURCES): [RESOURCE_SCHEMA],
+            }
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 
-def load_yaml(fname: str) -> JSON_TYPE:
-    """Load a YAML file."""
-    from ruamel.yaml import YAML
-    from ruamel.yaml.error import YAMLError
-    yaml = YAML(typ='rt')
-    try:
-        with open(fname, encoding='utf-8') as conf_file:
-            # If configuration file is empty YAML returns None
-            # We convert that to an empty dict
-            return yaml.load(conf_file) or OrderedDict()
-    except YAMLError as exc:
-        _LOGGER.error("YAML error: %s", exc)
-        raise HomeAssistantError(exc)
-    except UnicodeDecodeError as exc:
-        _LOGGER.error("Unable to read file %s: %s", fname, exc)
-        raise HomeAssistantError(exc)
-
-
-def load_config(fname: str) -> JSON_TYPE:
-    """Load a YAML file and adds id to card if not present."""
-    config = load_yaml(fname)
-    # Check if all cards have an ID or else add one
-    updated = False
-    for view in config.get('views', []):
-        for card in view.get('cards', []):
-            if 'id' not in card:
-                updated = True
-                card['id'] = uuid.uuid4().hex
-                card.move_to_end('id', last=False)
-    if updated:
-        save_yaml(fname, config)
-    return config
-
-
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Lovelace commands."""
-    # Backwards compat. Added in 0.80. Remove after 0.85
-    hass.components.websocket_api.async_register_command(
-        OLD_WS_TYPE_GET_LOVELACE_UI, websocket_lovelace_config,
-        SCHEMA_GET_LOVELACE_UI)
+    mode = config[DOMAIN][CONF_MODE]
+    yaml_resources = config[DOMAIN].get(CONF_RESOURCES)
 
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_GET_LOVELACE_UI, websocket_lovelace_config,
-        SCHEMA_GET_LOVELACE_UI)
+    frontend.async_register_built_in_panel(hass, DOMAIN, config={"mode": mode})
+
+    async def reload_resources_service_handler(service_call: ServiceCall) -> None:
+        """Reload yaml resources."""
+        try:
+            conf = await async_hass_config_yaml(hass)
+        except HomeAssistantError as err:
+            _LOGGER.error(err)
+            return
+
+        integration = await async_get_integration(hass, DOMAIN)
+
+        config = await async_process_component_config(hass, conf, integration)
+
+        resource_collection = await create_yaml_resource_col(
+            hass, config[DOMAIN].get(CONF_RESOURCES)
+        )
+        hass.data[DOMAIN]["resources"] = resource_collection
+
+    if mode == MODE_YAML:
+        default_config = dashboard.LovelaceYAML(hass, None, None)
+        resource_collection = await create_yaml_resource_col(hass, yaml_resources)
+
+        async_register_admin_service(
+            hass,
+            DOMAIN,
+            SERVICE_RELOAD_RESOURCES,
+            reload_resources_service_handler,
+            schema=RESOURCE_RELOAD_SERVICE_SCHEMA,
+        )
+
+    else:
+        default_config = dashboard.LovelaceStorage(hass, None)
+
+        if yaml_resources is not None:
+            _LOGGER.warning(
+                "Lovelace is running in storage mode. Define resources via user interface"
+            )
+
+        resource_collection = resources.ResourceStorageCollection(hass, default_config)
+
+        collection.StorageCollectionWebsocket(
+            resource_collection,
+            "lovelace/resources",
+            "resource",
+            RESOURCE_CREATE_FIELDS,
+            RESOURCE_UPDATE_FIELDS,
+        ).async_setup(hass, create_list=False)
+
+    websocket_api.async_register_command(hass, websocket.websocket_lovelace_config)
+    websocket_api.async_register_command(hass, websocket.websocket_lovelace_save_config)
+    websocket_api.async_register_command(
+        hass, websocket.websocket_lovelace_delete_config
+    )
+    websocket_api.async_register_command(hass, websocket.websocket_lovelace_resources)
+
+    websocket_api.async_register_command(hass, websocket.websocket_lovelace_dashboards)
+
+    hass.data[DOMAIN] = {
+        # We store a dictionary mapping url_path: config. None is the default.
+        "mode": mode,
+        "dashboards": {None: default_config},
+        "resources": resource_collection,
+        "yaml_dashboards": config[DOMAIN].get(CONF_DASHBOARDS, {}),
+    }
+
+    if hass.config.safe_mode:
+        return True
+
+    async def storage_dashboard_changed(change_type, item_id, item):
+        """Handle a storage dashboard change."""
+        url_path = item[CONF_URL_PATH]
+
+        if change_type == collection.CHANGE_REMOVED:
+            frontend.async_remove_panel(hass, url_path)
+            await hass.data[DOMAIN]["dashboards"].pop(url_path).async_delete()
+            return
+
+        if change_type == collection.CHANGE_ADDED:
+
+            existing = hass.data[DOMAIN]["dashboards"].get(url_path)
+
+            if existing:
+                _LOGGER.warning(
+                    "Cannot register panel at %s, it is already defined in %s",
+                    url_path,
+                    existing,
+                )
+                return
+
+            hass.data[DOMAIN]["dashboards"][url_path] = dashboard.LovelaceStorage(
+                hass, item
+            )
+
+            update = False
+        else:
+            hass.data[DOMAIN]["dashboards"][url_path].config = item
+            update = True
+
+        try:
+            _register_panel(hass, url_path, MODE_STORAGE, item, update)
+        except ValueError:
+            _LOGGER.warning("Failed to %s panel %s from storage", change_type, url_path)
+
+    # Process YAML dashboards
+    for url_path, dashboard_conf in hass.data[DOMAIN]["yaml_dashboards"].items():
+        # For now always mode=yaml
+        config = dashboard.LovelaceYAML(hass, url_path, dashboard_conf)
+        hass.data[DOMAIN]["dashboards"][url_path] = config
+
+        try:
+            _register_panel(hass, url_path, MODE_YAML, dashboard_conf, False)
+        except ValueError:
+            _LOGGER.warning("Panel url path %s is not unique", url_path)
+
+    # Process storage dashboards
+    dashboards_collection = dashboard.DashboardsCollection(hass)
+
+    dashboards_collection.async_add_listener(storage_dashboard_changed)
+    await dashboards_collection.async_load()
+
+    collection.StorageCollectionWebsocket(
+        dashboards_collection,
+        "lovelace/dashboards",
+        "dashboard",
+        STORAGE_DASHBOARD_CREATE_FIELDS,
+        STORAGE_DASHBOARD_UPDATE_FIELDS,
+    ).async_setup(hass, create_list=False)
 
     return True
 
 
-@websocket_api.async_response
-async def websocket_lovelace_config(hass, connection, msg):
-    """Send lovelace UI config over websocket config."""
-    error = None
-    try:
-        config = await hass.async_add_executor_job(
-            load_config, hass.config.path('ui-lovelace.yaml'))
-        message = websocket_api.result_message(
-            msg['id'], config
-        )
-    except FileNotFoundError:
-        error = ('file_not_found',
-                 'Could not find ui-lovelace.yaml in your config dir.')
-    except HomeAssistantError as err:
-        error = 'load_error', str(err)
+async def create_yaml_resource_col(hass, yaml_resources):
+    """Create yaml resources collection."""
+    if yaml_resources is None:
+        default_config = dashboard.LovelaceYAML(hass, None, None)
+        try:
+            ll_conf = await default_config.async_load(False)
+        except HomeAssistantError:
+            pass
+        else:
+            if CONF_RESOURCES in ll_conf:
+                _LOGGER.warning(
+                    "Resources need to be specified in your configuration.yaml. Please see the docs"
+                )
+                yaml_resources = ll_conf[CONF_RESOURCES]
 
-    if error is not None:
-        message = websocket_api.error_message(msg['id'], *error)
+    return resources.ResourceYAMLCollection(yaml_resources or [])
 
-    connection.send_message(message)
+
+@callback
+def _register_panel(hass, url_path, mode, config, update):
+    """Register a panel."""
+    kwargs = {
+        "frontend_url_path": url_path,
+        "require_admin": config[CONF_REQUIRE_ADMIN],
+        "config": {"mode": mode},
+        "update": update,
+    }
+
+    if config[CONF_SHOW_IN_SIDEBAR]:
+        kwargs["sidebar_title"] = config[CONF_TITLE]
+        kwargs["sidebar_icon"] = config.get(CONF_ICON, DEFAULT_ICON)
+
+    frontend.async_register_built_in_panel(hass, DOMAIN, **kwargs)
