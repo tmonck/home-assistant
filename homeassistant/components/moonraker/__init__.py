@@ -18,7 +18,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     connector = APIConnector(hass, session, entry)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {DATA_CONNECTOR: connector}
 
-    hass.config_entries.async_setup_platforms(entry, PLATFORMS)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await connector.start()
     return True
 
